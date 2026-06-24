@@ -2,18 +2,12 @@
 """Ollamaによる埋め込みベクトルの生成・保存形式・類似度計算."""
 
 import json
-import math
 import urllib.error
 import urllib.request
 
-from config import OLLAMA_API_URL, OLLAMA_EMBEDDING_MODEL, OLLAMA_TIMEOUT
+import numpy as np
 
-# NumPyがあれば類似度計算を行列演算で高速化する。
-# 無い場合でも純Python版にフォールバックして動作する（必須依存ではない）。
-try:
-    import numpy as _np
-except ImportError:  # pragma: no cover - NumPy未導入環境
-    _np = None
+from config import OLLAMA_API_URL, OLLAMA_EMBEDDING_MODEL, OLLAMA_TIMEOUT
 
 
 def embedding_text(instruction, input_value):
@@ -63,36 +57,20 @@ def deserialize_embedding(text):
     return json.loads(text)
 
 
-def cosine_similarity(vector_a, vector_b):
-    """2つのベクトルのコサイン類似度を返す（外部ライブラリ不使用）."""
-    if not vector_a or not vector_b:
-        return 0.0
-    dot = sum(a * b for a, b in zip(vector_a, vector_b))
-    norm_a = math.sqrt(sum(a * a for a in vector_a))
-    norm_b = math.sqrt(sum(b * b for b in vector_b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
 def _cosine_batch(query_vector, vectors):
-    """クエリベクトルと複数ベクトルのコサイン類似度をまとめて返す（list[float]）.
+    """クエリベクトルと複数ベクトルのコサイン類似度を行列演算でまとめて返す.
 
-    NumPyがあれば行列演算で一括計算し、無ければ純Python版を順に呼ぶ。
-    ノルム0のベクトルとの類似度は0.0として扱う。
+    戻り値は list[float]。ノルム0のベクトルとの類似度は0.0として扱う。
     """
     if not vectors:
         return []
-    if _np is None:
-        return [cosine_similarity(query_vector, v) for v in vectors]
-
-    query = _np.asarray(query_vector, dtype=float)
-    matrix = _np.asarray(vectors, dtype=float)
-    query_norm = _np.linalg.norm(query)
-    row_norms = _np.linalg.norm(matrix, axis=1)
+    query = np.asarray(query_vector, dtype=float)
+    matrix = np.asarray(vectors, dtype=float)
+    query_norm = np.linalg.norm(query)
+    row_norms = np.linalg.norm(matrix, axis=1)
     denom = row_norms * query_norm
     dots = matrix @ query
-    scores = _np.zeros_like(dots)
+    scores = np.zeros_like(dots)
     nonzero = denom != 0
     scores[nonzero] = dots[nonzero] / denom[nonzero]
     return scores.tolist()
