@@ -8,6 +8,13 @@ import urllib.request
 
 from config import OLLAMA_API_URL, OLLAMA_EMBEDDING_MODEL, OLLAMA_TIMEOUT
 
+# NumPyがあれば類似度計算を行列演算で高速化する。
+# 無い場合でも純Python版にフォールバックして動作する（必須依存ではない）。
+try:
+    import numpy as _np
+except ImportError:  # pragma: no cover - NumPy未導入環境
+    _np = None
+
 
 def embedding_text(instruction, input_value):
     """埋め込み対象とするテキストを instruction と input から組み立てる."""
@@ -66,6 +73,53 @@ def cosine_similarity(vector_a, vector_b):
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+def _cosine_batch(query_vector, vectors):
+    """クエリベクトルと複数ベクトルのコサイン類似度をまとめて返す（list[float]）.
+
+    NumPyがあれば行列演算で一括計算し、無ければ純Python版を順に呼ぶ。
+    ノルム0のベクトルとの類似度は0.0として扱う。
+    """
+    if not vectors:
+        return []
+    if _np is None:
+        return [cosine_similarity(query_vector, v) for v in vectors]
+
+    query = _np.asarray(query_vector, dtype=float)
+    matrix = _np.asarray(vectors, dtype=float)
+    query_norm = _np.linalg.norm(query)
+    row_norms = _np.linalg.norm(matrix, axis=1)
+    denom = row_norms * query_norm
+    dots = matrix @ query
+    scores = _np.zeros_like(dots)
+    nonzero = denom != 0
+    scores[nonzero] = dots[nonzero] / denom[nonzero]
+    return scores.tolist()
+
+
+def top_k_similar(query_vector, candidates, k):
+    """クエリに近い順に上位k件を返す.
+
+    candidates は (payload, vector) のリスト。戻り値は (score, payload) を
+    類似度の降順に最大k件並べたリスト。payload同士は比較しない（スコアの
+    みでソートする）ので、payloadがsqlite3.Row等でも安全。
+    """
+    if not candidates:
+        return []
+    payloads = [payload for payload, _ in candidates]
+    vectors = [vector for _, vector in candidates]
+    scores = _cosine_batch(query_vector, vectors)
+    ranked = sorted(
+        zip(scores, payloads), key=lambda pair: pair[0], reverse=True
+    )
+    return ranked[:k]
+
+
+def max_similarity(query_vector, vectors):
+    """クエリベクトルと各ベクトルの最大コサイン類似度を返す（無ければ0.0）."""
+    scores = _cosine_batch(query_vector, vectors)
+    return max(scores) if scores else 0.0
 
 
 def load_existing_embeddings(conn):

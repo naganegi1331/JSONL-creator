@@ -9,11 +9,11 @@ from tkinter import filedialog, messagebox, ttk
 from config import EXPORT_FILENAME, get_export_path
 from db import now_iso
 from embeddings import (
-    cosine_similarity,
     deserialize_embedding,
     embedding_text,
     ollama_embed,
     serialize_embedding,
+    top_k_similar,
 )
 from jsonl_io import import_jsonl_into_db
 
@@ -424,13 +424,13 @@ class JsonlCreatorApp:
             "SELECT id, instruction, output, embedding FROM records "
             "WHERE embedding != ''"
         ).fetchall()
-        scored = []
+        candidates = []
         for r in rows:
             vector = deserialize_embedding(r["embedding"])
             if vector:
-                scored.append((cosine_similarity(query_vector, vector), r))
+                candidates.append((r, vector))
 
-        if not scored:
+        if not candidates:
             messagebox.showinfo(
                 "類似検索",
                 "ベクトル化済みのデータがありません。先に"
@@ -438,8 +438,8 @@ class JsonlCreatorApp:
             )
             return
 
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        top = scored[:20]
+        # NumPyがあれば行列演算で一括計算（大規模データでも高速）
+        top = top_k_similar(query_vector, candidates, 20)
 
         for item in self.tree.get_children():
             self.tree.delete(item)

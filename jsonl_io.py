@@ -7,9 +7,9 @@ import os
 from config import NEAR_DUPLICATE_THRESHOLD, get_export_path
 from db import load_existing_keys, now_iso
 from embeddings import (
-    cosine_similarity,
     embedding_text,
     load_existing_embeddings,
+    max_similarity,
     ollama_embed,
     serialize_embedding,
 )
@@ -85,8 +85,8 @@ def import_jsonl_into_db(conn, path):
                     ollama_available = False
 
             if vector is not None and existing_embeddings:
-                best_score = max(
-                    cosine_similarity(vector, v) for _, v in existing_embeddings
+                best_score = max_similarity(
+                    vector, [v for _, v in existing_embeddings]
                 )
                 if best_score >= NEAR_DUPLICATE_THRESHOLD:
                     near_duplicate += 1
