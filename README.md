@@ -73,9 +73,18 @@ python jsonl_creator.py
 
 ## exe化
 
+`build.bat` をダブルクリック（またはコマンドプロンプトで実行）すると、
+PyInstallerの導入確認・インストールからビルドまでを自動で行います。
+
+```sh
+build.bat
+```
+
+手動で行う場合は以下のコマンドでも同様にビルドできます。
+
 ```sh
 pip install pyinstaller
-pyinstaller --onefile --noconsole jsonl_creator.py
+pyinstaller --onefile --noconsole --name jsonl_creator jsonl_creator.py
 ```
 
 生成された `dist/jsonl_creator.exe` を実行すると、exeと同じディレクトリに
