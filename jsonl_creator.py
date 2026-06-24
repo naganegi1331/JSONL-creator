@@ -52,7 +52,7 @@ def connect_db():
 
 
 def init_db(conn):
-    """recordsテーブルが無ければ作成する."""
+    """recordsテーブルが無ければ作成し、必要に応じてマイグレーションする."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS records (
@@ -60,11 +60,18 @@ def init_db(conn):
             instruction TEXT NOT NULL,
             input       TEXT NOT NULL DEFAULT '',
             output      TEXT NOT NULL,
+            source      TEXT NOT NULL DEFAULT '',
             created_at  TEXT NOT NULL,
             updated_at  TEXT NOT NULL
         )
         """
     )
+    # 旧バージョンで作成された source 列を持たないDBへの追加（マイグレーション）
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(records)")}
+    if "source" not in columns:
+        conn.execute(
+            "ALTER TABLE records ADD COLUMN source TEXT NOT NULL DEFAULT ''"
+        )
     conn.commit()
 
 
@@ -115,10 +122,12 @@ def import_jsonl_into_db(conn, path):
             instruction = obj.get("instruction", "")
             input_value = obj.get("input", "")
             output = obj.get("output", "")
+            source = obj.get("source", "")
             if not (
                 isinstance(instruction, str)
                 and isinstance(input_value, str)
                 and isinstance(output, str)
+                and isinstance(source, str)
             ):
                 invalid += 1
                 continue
@@ -127,6 +136,8 @@ def import_jsonl_into_db(conn, path):
                 invalid += 1
                 continue
 
+            # 重複判定は学習の三つ組（instruction/input/output）で行う。
+            # 同一の三つ組はsourceが異なっても重複として先勝ちでスキップする。
             key = (instruction, input_value, output)
             if key in existing:
                 duplicate += 1
@@ -134,9 +145,9 @@ def import_jsonl_into_db(conn, path):
 
             conn.execute(
                 "INSERT INTO records "
-                "(instruction, input, output, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (instruction, input_value, output, ts, ts),
+                "(instruction, input, output, source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (instruction, input_value, output, source, ts, ts),
             )
             existing.add(key)
             added += 1
@@ -259,14 +270,21 @@ class JsonlCreatorApp:
         self.output_text = tk.Text(frame, height=5, wrap="word")
         self.output_text.grid(row=5, column=0, sticky="nsew", pady=(0, 6))
 
+        # Source（任意）：引用元のURLや社内ユーザーガイドの参照先など
+        ttk.Label(
+            frame, text="Source (引用元: 参考URL、社内ユーザーガイド等／任意)"
+        ).grid(row=6, column=0, sticky="ew")
+        self.source_text = tk.Text(frame, height=2, wrap="word")
+        self.source_text.grid(row=7, column=0, sticky="ew", pady=(0, 6))
+
         # 編集状態の表示
         ttk.Label(frame, textvariable=self.status_var, foreground="#555").grid(
-            row=6, column=0, sticky="w", pady=(0, 4)
+            row=8, column=0, sticky="w", pady=(0, 4)
         )
 
         # 操作ボタン（2段構成：上段=レコード操作、下段=ファイル入出力）
         btns = ttk.Frame(frame)
-        btns.grid(row=7, column=0, sticky="ew")
+        btns.grid(row=9, column=0, sticky="ew")
         for i in range(6):
             btns.columnconfigure(i, weight=1)
 
@@ -311,6 +329,7 @@ class JsonlCreatorApp:
         instruction = self._get_value(self.instruction_text)
         input_value = self._get_value(self.input_text)
         output = self._get_value(self.output_text)
+        source = self._get_value(self.source_text)
 
         # 必須入力チェック（空白文字のみも空欄とみなす）
         if not instruction.strip() or not output.strip():
@@ -322,15 +341,15 @@ class JsonlCreatorApp:
             if self.current_id is None:
                 self.conn.execute(
                     "INSERT INTO records "
-                    "(instruction, input, output, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (instruction, input_value, output, ts, ts),
+                    "(instruction, input, output, source, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (instruction, input_value, output, source, ts, ts),
                 )
             else:
                 self.conn.execute(
                     "UPDATE records SET instruction = ?, input = ?, "
-                    "output = ?, updated_at = ? WHERE id = ?",
-                    (instruction, input_value, output, ts, self.current_id),
+                    "output = ?, source = ?, updated_at = ? WHERE id = ?",
+                    (instruction, input_value, output, source, ts, self.current_id),
                 )
             self.conn.commit()
         except sqlite3.Error as e:
@@ -414,7 +433,8 @@ class JsonlCreatorApp:
         """DB内の全レコードをAlpaca形式のJSONLとして書き出す."""
         try:
             rows = self.conn.execute(
-                "SELECT instruction, input, output FROM records ORDER BY id"
+                "SELECT instruction, input, output, source "
+                "FROM records ORDER BY id"
             ).fetchall()
         except sqlite3.Error as e:
             messagebox.showerror(
@@ -432,10 +452,12 @@ class JsonlCreatorApp:
         try:
             with open(get_export_path(), "w", encoding="utf-8") as f:
                 for r in rows:
+                    # 学習の三つ組はそのまま保ち、引用元は source 別キーで付与
                     record = {
                         "instruction": r["instruction"],
                         "input": r["input"],
                         "output": r["output"],
+                        "source": r["source"],
                     }
                     # 日本語はエスケープせず、特殊文字は json.dumps で正しく処理
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -493,12 +515,18 @@ class JsonlCreatorApp:
         self._set_text(self.instruction_text, row["instruction"])
         self._set_text(self.input_text, row["input"])
         self._set_text(self.output_text, row["output"])
+        self._set_text(self.source_text, row["source"])
         self._update_status()
 
     def _clear_inputs(self):
         """フォームをクリアし、新規入力モードへ戻す."""
         self.current_id = None
-        for w in (self.instruction_text, self.input_text, self.output_text):
+        for w in (
+            self.instruction_text,
+            self.input_text,
+            self.output_text,
+            self.source_text,
+        ):
             w.delete("1.0", "end")
         selection = self.tree.selection()
         if selection:
