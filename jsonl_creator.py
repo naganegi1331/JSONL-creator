@@ -12,15 +12,28 @@ DB     : SQLite（sqlite3・標準ライブラリ）
 
 import datetime
 import json
+import math
 import os
 import sqlite3
 import sys
 import tkinter as tk
+import urllib.error
+import urllib.request
 from tkinter import filedialog, messagebox, ttk
 
 
 DB_FILENAME = "training_data.db"
 EXPORT_FILENAME = "training_data.jsonl"
+
+# Ollama（ローカルLLM）の埋め込みAPI設定。
+# 事前に `ollama pull nomic-embed-text` 等でモデルを取得し、
+# Ollamaをローカルで起動しておく必要がある。
+OLLAMA_API_URL = "http://localhost:11434/api/embeddings"
+OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
+OLLAMA_TIMEOUT = 10  # 秒
+
+# インポート時、この類似度（コサイン類似度）以上を「類似重複」として報告する。
+NEAR_DUPLICATE_THRESHOLD = 0.93
 
 
 def get_base_dir():
@@ -66,11 +79,15 @@ def init_db(conn):
         )
         """
     )
-    # 旧バージョンで作成された source 列を持たないDBへの追加（マイグレーション）
+    # 旧バージョンで作成されたDBへの列追加（マイグレーション）
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(records)")}
     if "source" not in columns:
         conn.execute(
             "ALTER TABLE records ADD COLUMN source TEXT NOT NULL DEFAULT ''"
+        )
+    if "embedding" not in columns:
+        conn.execute(
+            "ALTER TABLE records ADD COLUMN embedding TEXT NOT NULL DEFAULT ''"
         )
     conn.commit()
 
@@ -78,6 +95,65 @@ def init_db(conn):
 def now_iso():
     """秒精度のISO形式タイムスタンプ文字列を返す."""
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def embedding_text(instruction, input_value):
+    """埋め込み対象とするテキストを instruction と input から組み立てる."""
+    instruction = instruction.strip()
+    input_value = input_value.strip()
+    if input_value:
+        return instruction + "\n\n" + input_value
+    return instruction
+
+
+def ollama_embed(text, model=OLLAMA_EMBEDDING_MODEL, timeout=OLLAMA_TIMEOUT):
+    """Ollamaのローカル埋め込みAPIを呼び出し、ベクトル（list[float]）を返す.
+
+    Ollamaが起動していない、モデルが未取得などの場合は OSError
+    （ConnectionRefusedError・urllib.error.URLError等を含む）を呼び出し元に
+    伝える。レスポンスの形式が想定外の場合は ValueError を送出する。
+    """
+    payload = json.dumps({"model": model, "prompt": text}).encode("utf-8")
+    request = urllib.request.Request(
+        OLLAMA_API_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = json.loads(response.read().decode("utf-8"))
+
+    vector = body.get("embedding")
+    if not isinstance(vector, list) or not vector:
+        raise ValueError("Ollamaから埋め込みベクトルを取得できませんでした。")
+    return vector
+
+
+def serialize_embedding(vector):
+    """埋め込みベクトルをDB保存用のJSON文字列に変換する."""
+    return json.dumps(vector)
+
+
+def deserialize_embedding(text):
+    """DBに保存されたJSON文字列を埋め込みベクトルに変換する.
+
+    未設定（空文字）の場合は None を返す。
+    """
+    if not text:
+        return None
+    return json.loads(text)
+
+
+def cosine_similarity(vector_a, vector_b):
+    """2つのベクトルのコサイン類似度を返す（外部ライブラリ不使用）."""
+    if not vector_a or not vector_b:
+        return 0.0
+    dot = sum(a * b for a, b in zip(vector_a, vector_b))
+    norm_a = math.sqrt(sum(a * a for a in vector_a))
+    norm_b = math.sqrt(sum(b * b for b in vector_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 def load_existing_keys(conn):
@@ -91,6 +167,19 @@ def load_existing_keys(conn):
     return {(r["instruction"], r["input"], r["output"]) for r in rows}
 
 
+def load_existing_embeddings(conn):
+    """DB内のベクトル化済みレコードを [(id, vector), ...] として返す."""
+    rows = conn.execute(
+        "SELECT id, embedding FROM records WHERE embedding != ''"
+    ).fetchall()
+    result = []
+    for r in rows:
+        vector = deserialize_embedding(r["embedding"])
+        if vector:
+            result.append((r["id"], vector))
+    return result
+
+
 def import_jsonl_into_db(conn, path):
     """JSONLファイルをDBへ取り込む.
 
@@ -99,11 +188,20 @@ def import_jsonl_into_db(conn, path):
     両方が対象）。必須項目（instruction / output）が空のもの、JSONとして
     解析できないもの、型が不正なものはスキップする。
 
-    戻り値: {"added": 追加件数, "duplicate": 重複件数, "invalid": 不正件数}
+    Ollamaが起動していれば、取り込む各レコードを埋め込みベクトル化して
+    保存し、既存データとのコサイン類似度が NEAR_DUPLICATE_THRESHOLD 以上
+    の場合は「類似重複」として報告する（スキップはしない。同じ質問でも
+    回答が異なるデータを残すのと同じ考え方）。Ollamaに接続できない場合は
+    ベクトル化を行わずに通常のインポートを続行する。
+
+    戻り値: {"added": 追加件数, "duplicate": 重複件数, "invalid": 不正件数,
+            "near_duplicate": 類似重複件数}
     """
     existing = load_existing_keys(conn)
-    added = duplicate = invalid = 0
+    existing_embeddings = load_existing_embeddings(conn)
+    added = duplicate = invalid = near_duplicate = 0
     ts = now_iso()
+    ollama_available = True
 
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -143,17 +241,47 @@ def import_jsonl_into_db(conn, path):
                 duplicate += 1
                 continue
 
-            conn.execute(
+            vector = None
+            if ollama_available:
+                try:
+                    vector = ollama_embed(embedding_text(instruction, input_value))
+                except (OSError, ValueError):
+                    # Ollamaに接続できないとみなし、以降は試行しない
+                    ollama_available = False
+
+            if vector is not None and existing_embeddings:
+                best_score = max(
+                    cosine_similarity(vector, v) for _, v in existing_embeddings
+                )
+                if best_score >= NEAR_DUPLICATE_THRESHOLD:
+                    near_duplicate += 1
+
+            cur = conn.execute(
                 "INSERT INTO records "
-                "(instruction, input, output, source, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (instruction, input_value, output, source, ts, ts),
+                "(instruction, input, output, source, embedding, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    instruction,
+                    input_value,
+                    output,
+                    source,
+                    serialize_embedding(vector) if vector is not None else "",
+                    ts,
+                    ts,
+                ),
             )
             existing.add(key)
+            if vector is not None:
+                existing_embeddings.append((cur.lastrowid, vector))
             added += 1
 
     conn.commit()
-    return {"added": added, "duplicate": duplicate, "invalid": invalid}
+    return {
+        "added": added,
+        "duplicate": duplicate,
+        "invalid": invalid,
+        "near_duplicate": near_duplicate,
+    }
 
 
 def import_legacy_jsonl(conn):
@@ -211,33 +339,53 @@ class JsonlCreatorApp:
         paned.add(self._build_form_pane(paned), weight=2)
 
     def _build_list_pane(self, parent):
-        """左ペイン：保存済みデータの一覧."""
+        """左ペイン：類似検索と保存済みデータの一覧."""
         frame = ttk.Frame(parent, padding=(8, 8))
-        frame.rowconfigure(1, weight=1)
+        frame.rowconfigure(2, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        ttk.Label(
-            frame, text="保存済みデータ（クリックで編集 / Ctrl・Shiftで複数選択）"
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        # 類似検索（Ollamaの埋め込みでベクトル化済みデータの中から検索）
+        search_frame = ttk.Frame(frame)
+        search_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        search_frame.columnconfigure(0, weight=1)
+        self.search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        search_entry.bind("<Return>", lambda event: self.search_similar())
+        ttk.Button(
+            search_frame, text="類似検索", command=self.search_similar
+        ).grid(row=0, column=1, padx=(0, 4))
+        ttk.Button(
+            search_frame, text="一覧に戻る", command=self._reload_list
+        ).grid(row=0, column=2)
+
+        self.list_label_var = tk.StringVar(
+            value="保存済みデータ（クリックで編集 / Ctrl・Shiftで複数選択）"
+        )
+        ttk.Label(frame, textvariable=self.list_label_var).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(0, 4)
+        )
 
         self.tree = ttk.Treeview(
             frame,
-            columns=("id", "instruction", "output"),
+            columns=("id", "instruction", "output", "score"),
             show="headings",
             selectmode="extended",
         )
         self.tree.heading("id", text="ID")
         self.tree.heading("instruction", text="Instruction")
         self.tree.heading("output", text="Output")
+        self.tree.heading("score", text="類似度")
         self.tree.column("id", width=40, anchor="center", stretch=False)
         self.tree.column("instruction", width=160)
-        self.tree.column("output", width=160)
-        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.tree.column("output", width=140)
+        self.tree.column("score", width=55, anchor="center", stretch=False)
+        self.tree.grid(row=2, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
         vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
-        vsb.grid(row=1, column=1, sticky="ns")
+        vsb.grid(row=2, column=1, sticky="ns")
 
         return frame
 
@@ -308,6 +456,12 @@ class JsonlCreatorApp:
             btns, text="JSONLにエクスポート", command=self.export_jsonl
         ).grid(row=1, column=3, columnspan=3, sticky="ew", padx=(3, 0))
 
+        ttk.Button(
+            btns,
+            text="ベクトル化（未処理分を一括処理・Ollama使用）",
+            command=self.embed_pending,
+        ).grid(row=2, column=0, columnspan=6, sticky="ew", pady=(4, 0))
+
         return frame
 
     # ------------------------------------------------------------------
@@ -346,9 +500,12 @@ class JsonlCreatorApp:
                     (instruction, input_value, output, source, ts, ts),
                 )
             else:
+                # 内容を更新した場合、既存の埋め込みベクトルは古くなるため
+                # クリアする（再ベクトル化は「ベクトル化（未処理分）」で行う）
                 self.conn.execute(
                     "UPDATE records SET instruction = ?, input = ?, "
-                    "output = ?, source = ?, updated_at = ? WHERE id = ?",
+                    "output = ?, source = ?, embedding = '', updated_at = ? "
+                    "WHERE id = ?",
                     (instruction, input_value, output, source, ts, self.current_id),
                 )
             self.conn.commit()
@@ -432,7 +589,8 @@ class JsonlCreatorApp:
             "インポート完了",
             f"追加: {result['added']} 件\n"
             f"重複スキップ: {result['duplicate']} 件\n"
-            f"不正スキップ: {result['invalid']} 件",
+            f"不正スキップ: {result['invalid']} 件\n"
+            f"類似重複（要確認・追加済み）: {result['near_duplicate']} 件",
         )
 
     def export_jsonl(self):
@@ -482,11 +640,113 @@ class JsonlCreatorApp:
             f"{len(rows)} 件を {EXPORT_FILENAME} に書き出しました。",
         )
 
+    def embed_pending(self):
+        """未ベクトル化のレコードをOllamaで一括ベクトル化する."""
+        rows = self.conn.execute(
+            "SELECT id, instruction, input FROM records WHERE embedding = ''"
+        ).fetchall()
+        if not rows:
+            messagebox.showinfo("ベクトル化", "未処理のデータはありません。")
+            return
+
+        succeeded = 0
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            for i, r in enumerate(rows):
+                text = embedding_text(r["instruction"], r["input"])
+                try:
+                    vector = ollama_embed(text)
+                except (OSError, ValueError) as e:
+                    if i == 0:
+                        # 最初の1件で失敗した場合はOllamaに接続できないとみなす
+                        messagebox.showerror(
+                            "ベクトル化エラー",
+                            "Ollamaに接続できませんでした。Ollamaが起動して"
+                            "いて、埋め込みモデルが利用可能か確認してください。"
+                            f"\n\n詳細: {e}",
+                        )
+                        return
+                    # 途中で接続できなくなった場合は、そこまでの結果を保存して終了
+                    break
+                self.conn.execute(
+                    "UPDATE records SET embedding = ? WHERE id = ?",
+                    (serialize_embedding(vector), r["id"]),
+                )
+                succeeded += 1
+            self.conn.commit()
+        finally:
+            self.root.config(cursor="")
+
+        messagebox.showinfo(
+            "ベクトル化完了",
+            f"{succeeded} / {len(rows)} 件のベクトル化が完了しました。",
+        )
+
+    def search_similar(self):
+        """検索ボックスのテキストをOllamaでベクトル化し、類似データを探す."""
+        query = self.search_var.get().strip()
+        if not query:
+            messagebox.showwarning(
+                "類似検索", "検索したい質問やキーワードを入力してください。"
+            )
+            return
+
+        try:
+            query_vector = ollama_embed(query)
+        except (OSError, ValueError) as e:
+            messagebox.showerror(
+                "類似検索エラー",
+                "Ollamaに接続できませんでした。Ollamaが起動していて、"
+                f"埋め込みモデルが利用可能か確認してください。\n\n詳細: {e}",
+            )
+            return
+
+        rows = self.conn.execute(
+            "SELECT id, instruction, output, embedding FROM records "
+            "WHERE embedding != ''"
+        ).fetchall()
+        scored = []
+        for r in rows:
+            vector = deserialize_embedding(r["embedding"])
+            if vector:
+                scored.append((cosine_similarity(query_vector, vector), r))
+
+        if not scored:
+            messagebox.showinfo(
+                "類似検索",
+                "ベクトル化済みのデータがありません。先に"
+                "「ベクトル化（未処理分を一括処理）」を実行してください。",
+            )
+            return
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        top = scored[:20]
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for score, r in top:
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(r["id"]),
+                values=(
+                    r["id"],
+                    _preview(r["instruction"]),
+                    _preview(r["output"]),
+                    f"{score:.3f}",
+                ),
+            )
+        self.list_label_var.set(f"類似検索結果（上位{len(top)}件・クリックで編集）")
+
     # ------------------------------------------------------------------
     # 一覧・選択・状態
     # ------------------------------------------------------------------
     def _reload_list(self):
         """DBの内容で一覧を再描画する."""
+        self.list_label_var.set(
+            "保存済みデータ（クリックで編集 / Ctrl・Shiftで複数選択）"
+        )
         for item in self.tree.get_children():
             self.tree.delete(item)
         rows = self.conn.execute(
@@ -501,6 +761,7 @@ class JsonlCreatorApp:
                     r["id"],
                     _preview(r["instruction"]),
                     _preview(r["output"]),
+                    "",
                 ),
             )
 
