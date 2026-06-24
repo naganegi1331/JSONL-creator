@@ -16,7 +16,7 @@ import os
 import sqlite3
 import sys
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 DB_FILENAME = "training_data.db"
@@ -73,46 +73,92 @@ def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+def load_existing_keys(conn):
+    """DB内の全レコードを (instruction, input, output) のキー集合として返す.
+
+    インポート時の完全一致重複チェックに用いる。
+    """
+    rows = conn.execute(
+        "SELECT instruction, input, output FROM records"
+    ).fetchall()
+    return {(r["instruction"], r["input"], r["output"]) for r in rows}
+
+
+def import_jsonl_into_db(conn, path):
+    """JSONLファイルをDBへ取り込む.
+
+    instruction・input・output の3フィールドが完全一致するレコードは
+    重複としてスキップする（DB内の既存データおよびファイル内の先行行の
+    両方が対象）。必須項目（instruction / output）が空のもの、JSONとして
+    解析できないもの、型が不正なものはスキップする。
+
+    戻り値: {"added": 追加件数, "duplicate": 重複件数, "invalid": 不正件数}
+    """
+    existing = load_existing_keys(conn)
+    added = duplicate = invalid = 0
+    ts = now_iso()
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                invalid += 1
+                continue
+            if not isinstance(obj, dict):
+                invalid += 1
+                continue
+
+            instruction = obj.get("instruction", "")
+            input_value = obj.get("input", "")
+            output = obj.get("output", "")
+            if not (
+                isinstance(instruction, str)
+                and isinstance(input_value, str)
+                and isinstance(output, str)
+            ):
+                invalid += 1
+                continue
+            # 必須項目チェック（空白文字のみも空欄とみなす）
+            if not instruction.strip() or not output.strip():
+                invalid += 1
+                continue
+
+            key = (instruction, input_value, output)
+            if key in existing:
+                duplicate += 1
+                continue
+
+            conn.execute(
+                "INSERT INTO records "
+                "(instruction, input, output, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (instruction, input_value, output, ts, ts),
+            )
+            existing.add(key)
+            added += 1
+
+    conn.commit()
+    return {"added": added, "duplicate": duplicate, "invalid": invalid}
+
+
 def import_legacy_jsonl(conn):
     """既存の training_data.jsonl をDBへ取り込む（初回のみ呼ばれる想定）.
 
-    取り込んだ件数を返す。ファイルが無い場合や解析に失敗した行は
-    スキップする。
+    取り込んだ件数を返す。ファイルが無い、または読み込めない場合は0。
     """
     path = get_export_path()
     if not os.path.exists(path):
         return 0
-
-    ts = now_iso()
-    count = 0
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                conn.execute(
-                    "INSERT INTO records "
-                    "(instruction, input, output, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        obj.get("instruction", ""),
-                        obj.get("input", ""),
-                        obj.get("output", ""),
-                        ts,
-                        ts,
-                    ),
-                )
-                count += 1
-        conn.commit()
+        result = import_jsonl_into_db(conn, path)
     except OSError:
         # 取り込みは任意処理。読み込めなければ何もしない。
         return 0
-    return count
+    return result["added"]
 
 
 def _preview(text, limit=40):
@@ -218,25 +264,31 @@ class JsonlCreatorApp:
             row=6, column=0, sticky="w", pady=(0, 4)
         )
 
-        # 操作ボタン
+        # 操作ボタン（2段構成：上段=レコード操作、下段=ファイル入出力）
         btns = ttk.Frame(frame)
         btns.grid(row=7, column=0, sticky="ew")
-        for i in range(4):
+        for i in range(6):
             btns.columnconfigure(i, weight=1)
 
         self.save_button = ttk.Button(
             btns, text="保存", command=self.save_entry
         )
-        self.save_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.save_button.grid(
+            row=0, column=0, columnspan=2, sticky="ew", padx=(0, 3), pady=(0, 4)
+        )
         ttk.Button(btns, text="新規入力", command=self.new_entry).grid(
-            row=0, column=1, sticky="ew", padx=4
+            row=0, column=2, columnspan=2, sticky="ew", padx=3, pady=(0, 4)
         )
         ttk.Button(btns, text="選択行を削除", command=self.delete_entry).grid(
-            row=0, column=2, sticky="ew", padx=4
+            row=0, column=4, columnspan=2, sticky="ew", padx=(3, 0), pady=(0, 4)
         )
+
+        ttk.Button(
+            btns, text="JSONLをインポート", command=self.import_jsonl
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", padx=(0, 3))
         ttk.Button(
             btns, text="JSONLにエクスポート", command=self.export_jsonl
-        ).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        ).grid(row=1, column=3, columnspan=3, sticky="ew", padx=(3, 0))
 
         return frame
 
@@ -322,6 +374,41 @@ class JsonlCreatorApp:
             return
         self._clear_inputs()
         self._reload_list()
+
+    def import_jsonl(self):
+        """JSONLファイルを選択してDBへ取り込む（完全一致重複はスキップ）."""
+        path = filedialog.askopenfilename(
+            title="インポートするJSONLファイルを選択",
+            filetypes=[
+                ("JSONL / JSON ファイル", "*.jsonl *.json"),
+                ("すべてのファイル", "*.*"),
+            ],
+        )
+        if not path:
+            return  # キャンセル
+
+        try:
+            result = import_jsonl_into_db(self.conn, path)
+        except OSError as e:
+            messagebox.showerror(
+                "インポートエラー",
+                "ファイルの読み込みに失敗しました。\n\n" f"詳細: {e}",
+            )
+            return
+        except sqlite3.Error as e:
+            messagebox.showerror(
+                "インポートエラー",
+                "データベースへの保存に失敗しました。\n\n" f"詳細: {e}",
+            )
+            return
+
+        self._reload_list()
+        messagebox.showinfo(
+            "インポート完了",
+            f"追加: {result['added']} 件\n"
+            f"重複スキップ: {result['duplicate']} 件\n"
+            f"不正スキップ: {result['invalid']} 件",
+        )
 
     def export_jsonl(self):
         """DB内の全レコードをAlpaca形式のJSONLとして書き出す."""
