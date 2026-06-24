@@ -216,15 +216,15 @@ class JsonlCreatorApp:
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        ttk.Label(frame, text="保存済みデータ（クリックで編集）").grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4)
-        )
+        ttk.Label(
+            frame, text="保存済みデータ（クリックで編集 / Ctrl・Shiftで複数選択）"
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
         self.tree = ttk.Treeview(
             frame,
             columns=("id", "instruction", "output"),
             show="headings",
-            selectmode="browse",
+            selectmode="extended",
         )
         self.tree.heading("id", text="ID")
         self.tree.heading("instruction", text="Instruction")
@@ -371,20 +371,26 @@ class JsonlCreatorApp:
         self._clear_inputs()
 
     def delete_entry(self):
-        """一覧で選択中のレコードを削除する."""
-        if self.current_id is None:
+        """一覧で選択中のレコード（複数可）を削除する."""
+        selection = self.tree.selection()
+        if not selection:
             messagebox.showwarning(
                 "削除", "削除する行を一覧から選択してください。"
             )
             return
-        if not messagebox.askyesno(
-            "削除確認", "選択したデータを削除します。よろしいですか？"
-        ):
+
+        count = len(selection)
+        message = (
+            f"選択した {count} 件のデータを削除します。よろしいですか？"
+            if count > 1
+            else "選択したデータを削除します。よろしいですか？"
+        )
+        if not messagebox.askyesno("削除確認", message):
             return
+
+        ids = [(int(iid),) for iid in selection]
         try:
-            self.conn.execute(
-                "DELETE FROM records WHERE id = ?", (self.current_id,)
-            )
+            self.conn.executemany("DELETE FROM records WHERE id = ?", ids)
             self.conn.commit()
         except sqlite3.Error as e:
             messagebox.showerror(
@@ -500,9 +506,20 @@ class JsonlCreatorApp:
 
     def _on_select(self, event):
         sel = self.tree.selection()
-        if not sel:
-            return
-        self._load_record(int(sel[0]))
+        if len(sel) == 1:
+            # 単一選択時のみフォームへ読み込んで編集モードにする
+            self._load_record(int(sel[0]))
+        else:
+            # 0件または複数選択時は単一の編集対象を持たず、フォームを空にする
+            self.current_id = None
+            for w in (
+                self.instruction_text,
+                self.input_text,
+                self.output_text,
+                self.source_text,
+            ):
+                w.delete("1.0", "end")
+            self._update_status()
 
     def _load_record(self, rec_id):
         """選択レコードをフォームへ読み込み、編集モードにする."""
@@ -536,12 +553,17 @@ class JsonlCreatorApp:
 
     def _update_status(self):
         """編集状態の表示と保存ボタンのラベルを更新する."""
-        if self.current_id is None:
-            self.status_var.set("● 新規入力中")
-            self.save_button.config(text="保存（新規追加）")
-        else:
+        if self.current_id is not None:
             self.status_var.set(f"● ID {self.current_id} を編集中")
             self.save_button.config(text="保存（更新）")
+            return
+
+        selected = len(self.tree.selection())
+        if selected >= 2:
+            self.status_var.set(f"● {selected} 件を選択中（削除できます）")
+        else:
+            self.status_var.set("● 新規入力中")
+        self.save_button.config(text="保存（新規追加）")
 
 
 def main():
