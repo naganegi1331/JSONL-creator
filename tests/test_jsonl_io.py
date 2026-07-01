@@ -19,6 +19,9 @@ import embeddings
 import jsonl_io
 
 
+DIM = 4  # NearDuplicateTest用の索引次元数（本番はconfig.EMBEDDING_DIM=768）
+
+
 def make_conn():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -152,7 +155,7 @@ class NearDuplicateTest(unittest.TestCase):
 
     def setUp(self):
         self.conn = make_conn()
-        db.init_db(self.conn)
+        db.init_db(self.conn, dim=DIM)
         self.paths = []
 
     def tearDown(self):
@@ -167,38 +170,46 @@ class NearDuplicateTest(unittest.TestCase):
 
     def _insert_with_embedding(self, instruction, output, vector):
         ts = db.now_iso()
-        self.conn.execute(
+        cur = self.conn.execute(
             "INSERT INTO records "
             "(instruction, input, output, source, embedding, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (instruction, "", output, "", embeddings.serialize_embedding(vector), ts, ts),
         )
+        self.conn.execute(
+            "INSERT INTO vec_records(rowid, embedding) VALUES (?, ?)",
+            (cur.lastrowid, embeddings.serialize_embedding(vector)),
+        )
         self.conn.commit()
 
     def test_detects_near_duplicate_when_similarity_high(self):
         # 既存ベクトルと、取り込む行のベクトルがほぼ同一 → 類似重複として計上
-        self._insert_with_embedding("元の質問", "元の回答", [1.0, 0.0, 0.0])
+        self._insert_with_embedding("元の質問", "元の回答", [1.0, 0.0, 0.0, 0.0])
         path = self._write([record_line("言い回し違いの質問", "", "別の回答")])
-        with mock.patch("jsonl_io.ollama_embed", return_value=[1.0, 0.0, 0.0]):
+        with mock.patch("jsonl_io.ollama_embed", return_value=[1.0, 0.0, 0.0, 0.0]):
             result = jsonl_io.import_jsonl_into_db(self.conn, path)
         # 完全一致ではないので追加はされ、件数のみ報告される
         self.assertEqual(result["added"], 1)
         self.assertEqual(result["near_duplicate"], 1)
 
     def test_no_near_duplicate_when_similarity_low(self):
-        self._insert_with_embedding("元の質問", "元の回答", [1.0, 0.0, 0.0])
+        self._insert_with_embedding("元の質問", "元の回答", [1.0, 0.0, 0.0, 0.0])
         path = self._write([record_line("全く別の質問", "", "全く別の回答")])
-        with mock.patch("jsonl_io.ollama_embed", return_value=[0.0, 1.0, 0.0]):
+        with mock.patch("jsonl_io.ollama_embed", return_value=[0.0, 1.0, 0.0, 0.0]):
             result = jsonl_io.import_jsonl_into_db(self.conn, path)
         self.assertEqual(result["added"], 1)
         self.assertEqual(result["near_duplicate"], 0)
 
     def test_imported_record_stores_embedding(self):
         path = self._write([record_line("新しい質問", "", "新しい回答")])
-        with mock.patch("jsonl_io.ollama_embed", return_value=[0.5, 0.5]):
+        with mock.patch("jsonl_io.ollama_embed", return_value=[0.5, 0.5, 0.0, 0.0]):
             jsonl_io.import_jsonl_into_db(self.conn, path)
         row = self.conn.execute("SELECT embedding FROM records").fetchone()
-        self.assertEqual(embeddings.deserialize_embedding(row["embedding"]), [0.5, 0.5])
+        self.assertEqual(
+            embeddings.deserialize_embedding(row["embedding"]), [0.5, 0.5, 0.0, 0.0]
+        )
+        indexed = self.conn.execute("SELECT COUNT(*) FROM vec_records").fetchone()[0]
+        self.assertEqual(indexed, 1)
 
 
 class LegacyImportTest(unittest.TestCase):

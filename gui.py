@@ -9,10 +9,10 @@ from tkinter import filedialog, messagebox, ttk
 from config import EXPORT_FILENAME, get_export_path
 from db import now_iso
 from embeddings import (
-    deserialize_embedding,
+    clear_vec_index,
     embedding_text,
     ollama_embed,
-    serialize_embedding,
+    save_embedding,
     top_k_similar,
 )
 from jsonl_io import import_jsonl_into_db
@@ -226,6 +226,7 @@ class JsonlCreatorApp:
                     "WHERE id = ?",
                     (instruction, input_value, output, source, ts, self.current_id),
                 )
+                clear_vec_index(self.conn, self.current_id)
             self.conn.commit()
         except sqlite3.Error as e:
             # 書き込み権限なし、DBロック、ディスク障害などで保存に失敗した場合。
@@ -266,6 +267,7 @@ class JsonlCreatorApp:
         ids = [(int(iid),) for iid in selection]
         try:
             self.conn.executemany("DELETE FROM records WHERE id = ?", ids)
+            self.conn.executemany("DELETE FROM vec_records WHERE rowid = ?", ids)
             self.conn.commit()
         except sqlite3.Error as e:
             messagebox.showerror(
@@ -387,10 +389,7 @@ class JsonlCreatorApp:
                         return
                     # 途中で接続できなくなった場合は、そこまでの結果を保存して終了
                     break
-                self.conn.execute(
-                    "UPDATE records SET embedding = ? WHERE id = ?",
-                    (serialize_embedding(vector), r["id"]),
-                )
+                save_embedding(self.conn, r["id"], vector)
                 succeeded += 1
             self.conn.commit()
         finally:
@@ -420,26 +419,16 @@ class JsonlCreatorApp:
             )
             return
 
-        rows = self.conn.execute(
-            "SELECT id, instruction, output, embedding FROM records "
-            "WHERE embedding != ''"
-        ).fetchall()
-        candidates = []
-        for r in rows:
-            vector = deserialize_embedding(r["embedding"])
-            if vector:
-                candidates.append((r, vector))
+        # sqlite-vecの索引（vec_records）に対するKNN検索で計算する
+        top = top_k_similar(self.conn, query_vector, 20)
 
-        if not candidates:
+        if not top:
             messagebox.showinfo(
                 "類似検索",
                 "ベクトル化済みのデータがありません。先に"
                 "「ベクトル化（未処理分を一括処理）」を実行してください。",
             )
             return
-
-        # NumPyがあれば行列演算で一括計算（大規模データでも高速）
-        top = top_k_similar(query_vector, candidates, 20)
 
         for item in self.tree.get_children():
             self.tree.delete(item)
