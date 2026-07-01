@@ -2,20 +2,37 @@
 """SQLite接続・スキーマ管理."""
 
 import datetime
+import json
 import sqlite3
 
-from config import get_db_path
+import sqlite_vec
+
+from config import EMBEDDING_DIM, get_db_path
 
 
 def connect_db():
     """DBへ接続し、行をdictライクに扱える接続を返す."""
     conn = sqlite3.connect(get_db_path())
     conn.row_factory = sqlite3.Row
+    load_vec_extension(conn)
     return conn
 
 
-def init_db(conn):
-    """recordsテーブルが無ければ作成し、必要に応じてマイグレーションする."""
+def load_vec_extension(conn):
+    """sqlite-vec拡張（ベクトル検索用のvec0仮想テーブルを提供）を読み込む."""
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+
+
+def init_db(conn, dim=EMBEDDING_DIM):
+    """recordsテーブルが無ければ作成し、必要に応じてマイグレーションする.
+
+    sqlite-vecのベクトル索引テーブル（vec_records）も無ければ作成し、
+    旧バージョンのDBで records.embedding に保存済みだが索引が無いベクトルを
+    バックフィルする。dim は索引テーブルの次元数（テスト用に差し替え可能）。
+    """
+    load_vec_extension(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS records (
@@ -39,6 +56,24 @@ def init_db(conn):
         conn.execute(
             "ALTER TABLE records ADD COLUMN embedding TEXT NOT NULL DEFAULT ''"
         )
+
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_records USING vec0("
+        f"embedding float[{dim}] distance_metric=cosine)"
+    )
+    # 旧バージョンのDBで records.embedding には値があるが vec_records に
+    # まだ登録されていない行を索引へ取り込む（sqlite-vec導入前のデータの移行）。
+    # ノルム0のベクトルは索引に登録しない（embeddings.index_vectorと同じ理由）。
+    rows = conn.execute(
+        "SELECT id, embedding FROM records WHERE embedding != '' "
+        "AND id NOT IN (SELECT rowid FROM vec_records)"
+    ).fetchall()
+    for row in rows:
+        if any(component != 0 for component in json.loads(row["embedding"])):
+            conn.execute(
+                "INSERT INTO vec_records(rowid, embedding) VALUES (?, ?)",
+                (row["id"], row["embedding"]),
+            )
     conn.commit()
 
 

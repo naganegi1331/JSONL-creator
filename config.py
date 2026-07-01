@@ -18,6 +18,11 @@ OLLAMA_TIMEOUT = 10  # 秒
 # インポート時、この類似度（コサイン類似度）以上を「類似重複」として報告する。
 NEAR_DUPLICATE_THRESHOLD = 0.93
 
+# 埋め込みベクトルの次元数（既定の埋め込みモデル nomic-embed-text の出力次元）。
+# sqlite-vec の索引テーブル（vec_records）はこの次元数で固定長として作成する。
+# 埋め込みモデルを変更する場合、次元数もあわせて変更する必要がある。
+EMBEDDING_DIM = 768
+
 
 def get_base_dir():
     """基準ディレクトリ（DB・エクスポート先の親）を返す.

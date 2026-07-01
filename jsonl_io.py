@@ -8,7 +8,7 @@ from config import NEAR_DUPLICATE_THRESHOLD, get_export_path
 from db import load_existing_keys, now_iso
 from embeddings import (
     embedding_text,
-    load_existing_embeddings,
+    index_vector,
     max_similarity,
     ollama_embed,
     serialize_embedding,
@@ -24,16 +24,16 @@ def import_jsonl_into_db(conn, path):
     解析できないもの、型が不正なものはスキップする。
 
     Ollamaが起動していれば、取り込む各レコードを埋め込みベクトル化して
-    保存し、既存データとのコサイン類似度が NEAR_DUPLICATE_THRESHOLD 以上
-    の場合は「類似重複」として報告する（スキップはしない。同じ質問でも
-    回答が異なるデータを残すのと同じ考え方）。Ollamaに接続できない場合は
-    ベクトル化を行わずに通常のインポートを続行する。
+    保存し、既存データとのコサイン類似度（sqlite-vecの索引によるKNN検索で
+    算出）が NEAR_DUPLICATE_THRESHOLD 以上の場合は「類似重複」として報告
+    する（スキップはしない。同じ質問でも回答が異なるデータを残すのと同じ
+    考え方）。Ollamaに接続できない場合はベクトル化を行わずに通常のインポート
+    を続行する。
 
     戻り値: {"added": 追加件数, "duplicate": 重複件数, "invalid": 不正件数,
             "near_duplicate": 類似重複件数}
     """
     existing = load_existing_keys(conn)
-    existing_embeddings = load_existing_embeddings(conn)
     added = duplicate = invalid = near_duplicate = 0
     ts = now_iso()
     ollama_available = True
@@ -84,10 +84,8 @@ def import_jsonl_into_db(conn, path):
                     # Ollamaに接続できないとみなし、以降は試行しない
                     ollama_available = False
 
-            if vector is not None and existing_embeddings:
-                best_score = max_similarity(
-                    vector, [v for _, v in existing_embeddings]
-                )
+            if vector is not None:
+                best_score = max_similarity(conn, vector)
                 if best_score >= NEAR_DUPLICATE_THRESHOLD:
                     near_duplicate += 1
 
@@ -107,7 +105,7 @@ def import_jsonl_into_db(conn, path):
             )
             existing.add(key)
             if vector is not None:
-                existing_embeddings.append((cur.lastrowid, vector))
+                index_vector(conn, cur.lastrowid, vector)
             added += 1
 
     conn.commit()

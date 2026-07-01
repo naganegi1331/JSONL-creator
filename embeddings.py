@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Ollamaによる埋め込みベクトルの生成・保存形式・類似度計算."""
+"""Ollamaによる埋め込みベクトルの生成・保存形式・sqlite-vecによる類似度計算."""
 
 import json
 import urllib.error
 import urllib.request
-
-import numpy as np
 
 from config import OLLAMA_API_URL, OLLAMA_EMBEDDING_MODEL, OLLAMA_TIMEOUT
 
@@ -57,57 +55,66 @@ def deserialize_embedding(text):
     return json.loads(text)
 
 
-def _cosine_batch(query_vector, vectors):
-    """クエリベクトルと複数ベクトルのコサイン類似度を行列演算でまとめて返す.
+def save_embedding(conn, record_id, vector):
+    """埋め込みベクトルをrecords列とsqlite-vec索引（vec_records）の両方に保存する.
 
-    戻り値は list[float]。ノルム0のベクトルとの類似度は0.0として扱う。
+    既に索引エントリがあれば置き換える（編集後の再ベクトル化にも対応）。
     """
-    if not vectors:
-        return []
-    query = np.asarray(query_vector, dtype=float)
-    matrix = np.asarray(vectors, dtype=float)
-    query_norm = np.linalg.norm(query)
-    row_norms = np.linalg.norm(matrix, axis=1)
-    denom = row_norms * query_norm
-    dots = matrix @ query
-    scores = np.zeros_like(dots)
-    nonzero = denom != 0
-    scores[nonzero] = dots[nonzero] / denom[nonzero]
-    return scores.tolist()
+    conn.execute(
+        "UPDATE records SET embedding = ? WHERE id = ?",
+        (serialize_embedding(vector), record_id),
+    )
+    index_vector(conn, record_id, vector)
 
 
-def top_k_similar(query_vector, candidates, k):
+def index_vector(conn, record_id, vector):
+    """ベクトルをsqlite-vec索引（vec_records）へ登録する（既存分は置き換え）.
+
+    ノルム0のベクトルはコサイン距離が定義できずNULLになり、KNN検索で
+    本来最も近いはずの候補より優先されてしまう（sqlite-vecの挙動）ため、
+    索引には登録しない（コサイン類似度は常に0なので検索結果からの除外は
+    実害がない）。
+    """
+    clear_vec_index(conn, record_id)
+    if any(component != 0 for component in vector):
+        conn.execute(
+            "INSERT INTO vec_records(rowid, embedding) VALUES (?, ?)",
+            (record_id, serialize_embedding(vector)),
+        )
+
+
+def clear_vec_index(conn, record_id):
+    """sqlite-vec索引（vec_records）から該当レコードのベクトルを削除する.
+
+    records.embedding列自体のクリアは呼び出し元の責務（本関数は索引のみ操作）。
+    """
+    conn.execute("DELETE FROM vec_records WHERE rowid = ?", (record_id,))
+
+
+def top_k_similar(conn, query_vector, k):
     """クエリに近い順に上位k件を返す.
 
-    candidates は (payload, vector) のリスト。戻り値は (score, payload) を
-    類似度の降順に最大k件並べたリスト。payload同士は比較しない（スコアの
-    みでソートする）ので、payloadがsqlite3.Row等でも安全。
+    sqlite-vecの索引テーブル（vec_records）に対するKNN検索で計算する
+    （未ベクトル化のレコードは対象外）。戻り値は (score, row) を類似度の
+    降順に最大k件並べたリスト。rowはid・instruction・outputを含むRow。
     """
-    if not candidates:
-        return []
-    payloads = [payload for payload, _ in candidates]
-    vectors = [vector for _, vector in candidates]
-    scores = _cosine_batch(query_vector, vectors)
-    ranked = sorted(
-        zip(scores, payloads), key=lambda pair: pair[0], reverse=True
-    )
-    return ranked[:k]
-
-
-def max_similarity(query_vector, vectors):
-    """クエリベクトルと各ベクトルの最大コサイン類似度を返す（無ければ0.0）."""
-    scores = _cosine_batch(query_vector, vectors)
-    return max(scores) if scores else 0.0
-
-
-def load_existing_embeddings(conn):
-    """DB内のベクトル化済みレコードを [(id, vector), ...] として返す."""
     rows = conn.execute(
-        "SELECT id, embedding FROM records WHERE embedding != ''"
+        "SELECT r.id, r.instruction, r.output, v.distance "
+        "FROM vec_records v JOIN records r ON r.id = v.rowid "
+        "WHERE v.embedding MATCH ? AND k = ? "
+        "ORDER BY v.distance",
+        (serialize_embedding(query_vector), k),
     ).fetchall()
-    result = []
-    for r in rows:
-        vector = deserialize_embedding(r["embedding"])
-        if vector:
-            result.append((r["id"], vector))
-    return result
+    return [(1.0 - row["distance"], row) for row in rows]
+
+
+def max_similarity(conn, query_vector):
+    """クエリベクトルと索引済みベクトルとの最大コサイン類似度を返す（無ければ0.0）."""
+    row = conn.execute(
+        "SELECT distance FROM vec_records WHERE embedding MATCH ? AND k = 1 "
+        "ORDER BY distance",
+        (serialize_embedding(query_vector),),
+    ).fetchone()
+    if row is None or row["distance"] is None:
+        return 0.0
+    return 1.0 - row["distance"]
